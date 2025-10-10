@@ -1,8 +1,12 @@
-# smart_claims_app.py
+# =========================================================
+# Smart Duplicate Detection & Chat-Aware Subclustering
+# =========================================================
+# (CLIP + SentenceTransformer + FAISS version)
+# =========================================================
+
 import os
 import uuid
 import sqlite3
-import io
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -19,10 +23,8 @@ import faiss
 # -----------------------
 DB_FILE = "claims_smart.db"
 IMAGE_FOLDER = "./images"
-INDEX_FILE = "faiss_index.ivf"   # file path if you want to save index (optional)
-IDMAP_FILE = "faiss_idmap.npy"   # maps faiss internal idx -> record primary key (row id)
-EMB_DIM_IMG = 512   # CLIP image embed dim (typical)
-TEXT_DIM = 384      # all-MiniLM-L6-v2 dim (typical)
+EMB_DIM_IMG = 512
+TEXT_DIM = 384
 IMG_WEIGHT = 0.5
 TEXT_WEIGHT = 0.5
 TOP_K = 5
@@ -31,15 +33,12 @@ os.makedirs(IMAGE_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # -----------------------
-# MODELS
+# MODEL INITIALIZATION
 # -----------------------
-# CLIP (for image features)
-clip_model_path = os.path.abspath("./clip_model")  # your offline clip path or model id
+clip_model_path = os.path.abspath("./clip_model")
 clip = CLIPModel.from_pretrained(clip_model_path, local_files_only=True).to(device)
 clip_processor = CLIPProcessor.from_pretrained(clip_model_path, local_files_only=True)
-
-# Sentence Transformer for text/chat/damage embeddings (language-specialized)
-sbert = SentenceTransformer("all-MiniLM-L6-v2", device="cuda" if torch.cuda.is_available() else "cpu")
+sbert = SentenceTransformer("all-MiniLM-L6-v2", device=device)
 
 # -----------------------
 # DATABASE SETUP
@@ -74,283 +73,204 @@ CREATE TABLE IF NOT EXISTS records (
 conn.commit()
 
 # -----------------------
-# FAISS INDEX HANDLING
+# UTILS
 # -----------------------
-# We'll use an inner-product index on normalized vectors for cosine similarity
-# Combined embedding dim = img_dim + text_dim
-COMBINED_DIM = EMB_DIM_IMG + TEXT_DIM
 
-def build_faiss_index():
-    """Build FAISS index from embeddings stored in DB. Returns index and id_map (list of DB ids)."""
-    c.execute("SELECT id, embedding FROM records WHERE embedding IS NOT NULL")
-    rows = c.fetchall()
-    if not rows:
-        # empty index
-        index = faiss.IndexFlatIP(COMBINED_DIM)
-        id_map = np.array([], dtype=np.int64)
-        return index, id_map
+def generate_unique_image_id():
+    """Generates short unique ID for each new main cluster."""
+    return f"C-{str(uuid.uuid4())[:6]}"
 
-    # reconstruct matrix
-    ids = []
-    mats = []
-    for rid, emb_blob in rows:
-        if emb_blob is None:
-            continue
-        vec = np.frombuffer(emb_blob, dtype=np.float32)
-        if vec.size != COMBINED_DIM:
-            # skip corrupted dims
-            continue
-        mats.append(vec)
-        ids.append(rid)
-    if len(mats) == 0:
-        index = faiss.IndexFlatIP(COMBINED_DIM)
-        return index, np.array([], dtype=np.int64)
-
-    mat = np.vstack(mats).astype(np.float32)
-    # ensure normalized (for cosine)
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    mat = mat / norms
-
-    index = faiss.IndexFlatIP(COMBINED_DIM)
-    index.add(mat)
-    id_map = np.array(ids, dtype=np.int64)
-    return index, id_map
-
-# initialize index on startup
-faiss_index, faiss_idmap = build_faiss_index()
-
-def add_vector_to_index(vec: np.ndarray, db_id: int):
-    """Add a single vector to FAISS index and append id mapping."""
-    global faiss_index, faiss_idmap
-    v = vec.astype(np.float32)
-    # normalize
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        v = v
-    else:
-        v = v / norm
-    v = v.reshape(1, -1)
-    faiss_index.add(v)
-    if faiss_idmap.size == 0:
-        faiss_idmap = np.array([db_id], dtype=np.int64)
-    else:
-        faiss_idmap = np.concatenate([faiss_idmap, np.array([db_id], dtype=np.int64)])
-
-# -----------------------
-# EMBEDDING UTILS
-# -----------------------
-def get_image_embedding(image: Image.Image):
-    inputs = clip_processor(images=image, return_tensors="pt").to(device)
-    with torch.no_grad():
-        img_emb = clip.get_image_features(inputs["pixel_values"])
-    img_emb = img_emb.cpu().numpy().reshape(-1)  # shape (EMB_DIM_IMG,)
-    return img_emb.astype(np.float32)
-
-def get_text_embedding(text: str):
-    if not text:
-        return np.zeros((TEXT_DIM,), dtype=np.float32)
-    emb = sbert.encode([text], normalize_embeddings=True)[0]  # already normed
-    return emb.astype(np.float32)
-
-def get_combined_embedding(image: Image.Image, description: str, chat_text: str, damage_text: str):
-    """Return concatenated (img, text) vector then L2-normalized."""
-    img_emb = get_image_embedding(image)
-    # combine description+chat as one text
-    text_full = (description or "") + " " + (chat_text or "")
-    text_emb = get_text_embedding(text_full)
-    damage_emb = get_text_embedding(damage_text or "")
-    # fuse: we'll append image + (text + damage) concatenated -> we average text vectors weighted
-    # Make final text vector as weighted avg of description+chat and damage label
-    text_combined = 0.8 * text_emb + 0.2 * damage_emb
-    # normalize individual pieces then concat
-    # ensure dims
-    img_emb = img_emb / (np.linalg.norm(img_emb) + 1e-10)
-    text_combined = text_combined / (np.linalg.norm(text_combined) + 1e-10)
-    combined = np.concatenate([IMG_WEIGHT * img_emb, TEXT_WEIGHT * text_combined])  # length EMB_IMG + TEXT_DIM
-    # normalize final
-    combined = combined.astype(np.float32)
-    combined = combined / (np.linalg.norm(combined) + 1e-10)
-    return combined
-
-# -----------------------
-# DB helpers
-# -----------------------
-def save_image_to_disk(image: Image.Image, image_hash: str):
+def save_image_to_disk(image, image_hash):
     path = os.path.join(IMAGE_FOLDER, f"{image_hash}.png")
     image.save(path)
     return path
 
-def insert_record(record: dict):
-    # make sure columns order matches DB
-    cols = ["unique_image_id","sub_cluster_id","customer_id","order_id","ip_country_code","billing_country_code",
-            "shipping_country_code","credit_card_country_code","fast_lane","isfba","has_prime","gl_code",
-            "payment_method","issuing_bank","description","chat_text","damage_classification","image_hash","embedding"]
-    values = [record.get(c, None) for c in cols]
-    placeholders = ",".join(["?"] * len(cols))
-    query = f"INSERT INTO records ({','.join(cols)}) VALUES ({placeholders})"
-    c.execute(query, values)
-    conn.commit()
-    return c.lastrowid
+def get_image_embedding(image):
+    inputs = clip_processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad():
+        img_emb = clip.get_image_features(inputs["pixel_values"])
+    return img_emb.cpu().numpy().flatten().astype(np.float32)
 
-def delete_record_by_id(db_id: int):
-    # delete image file if exists
-    c.execute("SELECT image_hash FROM records WHERE id=?", (db_id,))
-    r = c.fetchone()
-    if r and r[0]:
-        p = os.path.join(IMAGE_FOLDER, f"{r[0]}.png")
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-    c.execute("DELETE FROM records WHERE id=?", (db_id,))
-    conn.commit()
-    # rebuild index (safe simple approach)
-    rebuild_index()
+def get_text_embedding(text):
+    if not text:
+        return np.zeros((TEXT_DIM,), dtype=np.float32)
+    emb = sbert.encode([text], normalize_embeddings=True)[0]
+    return emb.astype(np.float32)
+
+def get_combined_embedding(image, description, chat_text, damage_text):
+    img_emb = get_image_embedding(image)
+    text_emb = get_text_embedding(description + " " + chat_text)
+    dmg_emb = get_text_embedding(damage_text)
+    text_combined = 0.8 * text_emb + 0.2 * dmg_emb
+
+    img_emb /= (np.linalg.norm(img_emb) + 1e-10)
+    text_combined /= (np.linalg.norm(text_combined) + 1e-10)
+
+    combined = np.concatenate([IMG_WEIGHT * img_emb, TEXT_WEIGHT * text_combined])
+    combined /= (np.linalg.norm(combined) + 1e-10)
+    return combined.astype(np.float32)
+
+# -----------------------
+# FAISS SETUP
+# -----------------------
+COMBINED_DIM = EMB_DIM_IMG + TEXT_DIM
+
+def build_faiss_index():
+    c.execute("SELECT id, embedding FROM records WHERE embedding IS NOT NULL")
+    rows = c.fetchall()
+    index = faiss.IndexFlatIP(COMBINED_DIM)
+    ids, vectors = [], []
+
+    for rid, blob in rows:
+        vec = np.frombuffer(blob, dtype=np.float32)
+        if vec.size == COMBINED_DIM:
+            vectors.append(vec)
+            ids.append(rid)
+
+    if vectors:
+        mat = np.vstack(vectors)
+        mat /= np.linalg.norm(mat, axis=1, keepdims=True)
+        index.add(mat)
+
+    return index, np.array(ids, dtype=np.int64)
+
+faiss_index, faiss_idmap = build_faiss_index()
+
+def add_vector_to_index(vec, db_id):
+    global faiss_index, faiss_idmap
+    v = vec / (np.linalg.norm(vec) + 1e-10)
+    faiss_index.add(v.reshape(1, -1))
+    faiss_idmap = np.append(faiss_idmap, db_id)
 
 def rebuild_index():
     global faiss_index, faiss_idmap
     faiss_index, faiss_idmap = build_faiss_index()
 
 # -----------------------
-# Duplicate check using FAISS + hybrid damage similarity
+# DUPLICATE CHECK
 # -----------------------
-def compute_damage_similarity(a_label: str, b_label: str):
-    if not a_label or not b_label:
+def compute_damage_similarity(a, b):
+    if not a or not b:
         return 0.0
-    a_emb = get_text_embedding(a_label)
-    b_emb = get_text_embedding(b_label)
-    return float(np.dot(a_emb, b_emb) / ((np.linalg.norm(a_emb) * np.linalg.norm(b_emb)) + 1e-10))
+    a_emb = get_text_embedding(a)
+    b_emb = get_text_embedding(b)
+    return float(np.dot(a_emb, b_emb))
 
-def check_duplicates_fast(image: Image.Image, description: str, chat_text: str, damage_classification: str):
-    """
-    Returns (status, matched_unique_image_id or None, matched_db_id or None, top_matches list)
-    status in {"Exact Duplicate","Similar Image","Same Narrative","No Duplicate"}
-    """
+def check_duplicates_fast(image, description, chat_text, damage_classification):
     image_hash = str(imagehash.phash(image))
-    # hash exact check first
+
+    # Quick hash check
     c.execute("SELECT id, unique_image_id FROM records WHERE image_hash=?", (image_hash,))
     row = c.fetchone()
     if row:
         return ("Exact Duplicate", row[1], row[0], [])
 
-    # compute combined embedding
-    new_vec = get_combined_embedding(image, description, chat_text, damage_classification)
+    vec = get_combined_embedding(image, description, chat_text, damage_classification)
     if faiss_idmap.size == 0:
         return ("No Duplicate", None, None, [])
 
-    # query FAISS
-    q = new_vec.astype(np.float32).reshape(1, -1)
+    q = vec.reshape(1, -1)
     D, I = faiss_index.search(q, min(TOP_K, faiss_index.ntotal))
-    D = D.flatten()
-    I = I.flatten()
-    # map indices to db ids
-    matched = []
-    for sim, idx in zip(D, I):
+
+    matches = []
+    for sim, idx in zip(D[0], I[0]):
         if idx < 0:
             continue
         db_id = int(faiss_idmap[idx])
         c.execute("SELECT unique_image_id, embedding, damage_classification FROM records WHERE id=?", (db_id,))
-        fetched = c.fetchone()
-        if not fetched:
+        r = c.fetchone()
+        if not r:
             continue
-        unique_id, emb_blob, stored_damage = fetched
-        # convert stored embedding to vector (already normalized at insertion)
-        try:
-            stored_vec = np.frombuffer(emb_blob, dtype=np.float32)
-        except Exception:
-            stored_vec = None
-        # compute refined similarity if stored_vec available
-        if stored_vec is not None and stored_vec.size == new_vec.size:
-            sim_val = float(np.dot(new_vec, stored_vec) / ((np.linalg.norm(new_vec) * np.linalg.norm(stored_vec)) + 1e-10))
-        else:
-            sim_val = float(sim)  # use faiss score fallback
-        damage_sim = compute_damage_similarity(damage_classification or "", stored_damage or "")
-        matched.append((db_id, unique_id, sim_val, damage_sim, stored_damage))
-    # decide best match according to hybrid rule
-    if not matched:
+        uid, emb_blob, stored_damage = r
+        emb_vec = np.frombuffer(emb_blob, dtype=np.float32)
+        cos_sim = float(np.dot(vec, emb_vec))
+        dmg_sim = compute_damage_similarity(damage_classification, stored_damage)
+        matches.append((db_id, uid, cos_sim, dmg_sim, stored_damage))
+
+    if not matches:
         return ("No Duplicate", None, None, [])
-    # sort by sim_val desc
-    matched.sort(key=lambda x: x[2], reverse=True)
-    best = matched[0]
-    best_dbid, best_uid, best_sim, best_damage_sim, stored_damage = best
 
-    # hybrid acceptance rule (tunable)
-    if best_sim >= 0.80:
-        return ("Similar Image", best_uid, best_dbid, matched)
-    if best_sim >= 0.70 and best_damage_sim >= 0.70:
-        return ("Same Narrative", best_uid, best_dbid, matched)
-    return ("No Duplicate", None, None, matched)
+    matches.sort(key=lambda x: x[2], reverse=True)
+    best = matches[0]
+
+    if best[2] >= 0.8:
+        return ("Similar Image", best[1], best[0], matches)
+    if best[2] >= 0.7 and best[3] >= 0.7:
+        return ("Same Narrative", best[1], best[0], matches)
+    return ("No Duplicate", None, None, matches)
 
 # -----------------------
-# Subclustering: reuse your weighted approach (with chat similarity)
+# SUBCLUSTER LOGIC
 # -----------------------
-def compute_similarity(row_a, row_b, chat_sim=0):
-    t1 = ["billing_country_code", "shipping_country_code", "credit_card_country_code"]
-    t1_score = sum((row_a.get(f) == row_b.get(f)) for f in t1) / len(t1)
-    t2 = ["isfba", "has_prime", "fast_lane"]
-    t2_score = sum((row_a.get(f) == row_b.get(f)) for f in t2) / len(t2)
-    t3 = ["ip_country_code", "payment_method", "issuing_bank"]
-    t3_score = sum((row_a.get(f) == row_b.get(f)) for f in t3) / len(t3)
-    return 0.45 * t1_score + 0.25 * t2_score + 0.15 * t3_score + 0.15 * chat_sim
-
-def get_chat_similarity(chat_a, chat_b):
-    if not chat_a or not chat_b:
-        return 0.0
-    a = set(str(chat_a).lower().split())
-    b = set(str(chat_b).lower().split())
+def get_chat_similarity(a, b):
     if not a or not b:
         return 0.0
-    return float(len(a & b) / len(a | b))
+    sa, sb = set(a.lower().split()), set(b.lower().split())
+    return len(sa & sb) / len(sa | sb)
+
+def compute_similarity(row_a, row_b, chat_sim):
+    t1 = ["billing_country_code", "shipping_country_code", "credit_card_country_code"]
+    t2 = ["isfba", "has_prime", "fast_lane"]
+    t3 = ["ip_country_code", "payment_method", "issuing_bank"]
+    s1 = sum(row_a.get(f) == row_b.get(f) for f in t1) / len(t1)
+    s2 = sum(row_a.get(f) == row_b.get(f) for f in t2) / len(t2)
+    s3 = sum(row_a.get(f) == row_b.get(f) for f in t3) / len(t3)
+    return 0.45 * s1 + 0.25 * s2 + 0.15 * s3 + 0.15 * chat_sim
 
 def assign_subcluster(df, new_row):
     subset = df[df["unique_image_id"] == new_row["unique_image_id"]]
     if subset.empty:
         return f"{new_row['unique_image_id']}_S0"
-    best_sim, best_id = 0.0, None
-    for _, row in subset.iterrows():
-        chat_sim = get_chat_similarity(row.get("chat_text",""), new_row.get("chat_text",""))
-        sim = compute_similarity(row.to_dict(), new_row, chat_sim)
+
+    best_sim, best_id = 0, None
+    for _, r in subset.iterrows():
+        chat_sim = get_chat_similarity(r.get("chat_text", ""), new_row.get("chat_text", ""))
+        sim = compute_similarity(r, new_row, chat_sim)
         if sim > best_sim:
-            best_sim, best_id = sim, row["sub_cluster_id"]
+            best_sim, best_id = sim, r["sub_cluster_id"]
+
     if best_sim >= 0.8:
         return best_id
-    else:
-        existing = subset["sub_cluster_id"].dropna().unique()
-        num = len(existing)
-        return f"{new_row['unique_image_id']}_S{num}"
+    num = len(subset["sub_cluster_id"].dropna().unique())
+    return f"{new_row['unique_image_id']}_S{num}"
 
 # -----------------------
-# Streamlit UI
+# STREAMLIT UI
 # -----------------------
 st.set_page_config(layout="wide")
 st.sidebar.title("Navigation")
 menu = st.sidebar.radio("Go to:", ["Submit Claim", "Database Viewer", "Rebuild Index"])
-st.title("Smart Claim Duplicate Detection (CLIP + SBERT + FAISS)")
+st.title("Smart Duplicate Detection & Chat-Aware Subclustering")
 
 if menu == "Rebuild Index":
-    st.info("Rebuilding FAISS index from DB... (this may take a moment)")
+    st.info("Rebuilding FAISS index...")
     rebuild_index()
-    st.success("Rebuilt index.")
+    st.success("Index rebuilt successfully.")
     st.stop()
 
-# ---------------- Submit Claim ----------------
+# -------------------------------------------------------
+# SUBMIT CLAIM
+# -------------------------------------------------------
 if menu == "Submit Claim":
     st.subheader("Submit New Claim (Smart Mode)")
+
     col1, col2 = st.columns(2)
-    customer_id = col1.text_input("Customer ID")
+    cust_id = col1.text_input("Customer ID")
     order_id = col2.text_input("Order ID")
+
     col3, col4 = st.columns(2)
     ip_code = col3.text_input("IP Country Code")
     billing_code = col4.text_input("Billing Country Code")
+
     col5, col6 = st.columns(2)
     shipping_code = col5.text_input("Shipping Country Code")
     credit_card_code = col6.text_input("Credit Card Country Code")
+
     col7, col8, col9 = st.columns(3)
-    fast_lane = col7.selectbox("Fast Lane", [0,1])
-    isfba = col8.selectbox("Is FBA", [0,1])
-    has_prime = col9.selectbox("Has Prime", [0,1])
+    fast_lane = col7.selectbox("Fast Lane", [0, 1])
+    isfba = col8.selectbox("Is FBA", [0, 1])
+    has_prime = col9.selectbox("Has Prime", [0, 1])
+
     col10, col11, col12 = st.columns(3)
     gl_code = col10.text_input("GL Code")
     payment_method = col11.text_input("Payment Method")
@@ -358,21 +278,21 @@ if menu == "Submit Claim":
 
     description = st.text_area("Image Description", height=80)
     chat_text = st.text_area("Chat Conversation (optional)", height=120)
-    damage_classification = st.selectbox("Damage Classification", 
-                                        ["Burnt","Spilled","Broken","Scratched","Missing item",
-                                         "Malfunctioning","Stained","Packaging Damaged",
-                                         "Expired","Leaking","Other"])
-    uploaded = st.file_uploader("Upload Image", type=["png","jpg","jpeg"])
+    damage_classification = st.selectbox(
+        "Damage Classification",
+        ["Burnt", "Spilled", "Broken", "Scratched", "Missing item",
+         "Malfunctioning", "Stained", "Packaging Damaged", "Expired", "Leaking", "Other"]
+    )
 
-    if uploaded is not None and st.button("Check for Duplicates & Save"):
-        image = Image.open(uploaded).convert("RGB")
-        # first run the hybrid fast check
-        status, matched_uid, matched_dbid, top_matches = check_duplicates_fast(image, description, chat_text, damage_classification)
-        image_hash = str(imagehash.phash(image))
-        save_image_to_disk(image, image_hash)
-        combined_emb = get_combined_embedding(image, description, chat_text, damage_classification)
-        # store embedding bytes
-        emb_blob = combined_emb.astype(np.float32).tobytes()
+    uploaded = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+
+    if uploaded and st.button("Check for Duplicates & Save"):
+        img = Image.open(uploaded).convert("RGB")
+        status, matched_uid, matched_dbid, top_matches = check_duplicates_fast(img, description, chat_text, damage_classification)
+        image_hash = str(imagehash.phash(img))
+        save_image_to_disk(img, image_hash)
+        emb_vec = get_combined_embedding(img, description, chat_text, damage_classification)
+        emb_blob = emb_vec.tobytes()
 
         uid = generate_unique_image_id() if status == "No Duplicate" else matched_uid
         df_existing = pd.read_sql_query("SELECT * FROM records", conn)
@@ -395,7 +315,7 @@ if menu == "Submit Claim":
         record = {
             "unique_image_id": uid,
             "sub_cluster_id": sub_cluster_id,
-            "customer_id": customer_id,
+            "customer_id": cust_id,
             "order_id": order_id,
             "ip_country_code": ip_code,
             "billing_country_code": billing_code,
@@ -413,66 +333,76 @@ if menu == "Submit Claim":
             "image_hash": image_hash,
             "embedding": emb_blob
         }
-        new_db_id = insert_record(record)
-        # add to faiss index
-        add_vector_to_index(combined_emb, new_db_id)
 
-        # UI feedback
+        cols = list(record.keys())
+        vals = [record[c] for c in cols]
+        c.execute(f"INSERT INTO records ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", vals)
+        conn.commit()
+        new_id = c.lastrowid
+        add_vector_to_index(emb_vec, new_id)
+
         if status == "No Duplicate":
-            st.success(f"✅ New main cluster created. UID: {uid}")
+            st.success(f"✅ New main cluster created: {uid}")
         else:
-            st.warning(f"⚠️ {status} found. Linked to existing cluster: {uid}")
+            st.warning(f"⚠️ {status} found. Linked to cluster: {uid}")
         st.info(f"Assigned Subcluster: {sub_cluster_id}")
-        # show top matches for debugging/insight
-        if top_matches:
-            st.write("Top matches (db_id, unique_id, sim, damage_sim, stored_damage):")
-            st.table(pd.DataFrame(top_matches, columns=["db_id","unique_id","sim","damage_sim","stored_damage"]))
 
-# ---------------- Database Viewer ----------------
+# -------------------------------------------------------
+# DATABASE VIEWER
+# -------------------------------------------------------
 elif menu == "Database Viewer":
-    st.subheader("Database Viewer — Full Audit Mode")
+    st.subheader("Database Viewer — All Inputs + Images")
     df = pd.read_sql_query("""
         SELECT id, unique_image_id, sub_cluster_id, customer_id, order_id,
         ip_country_code, billing_country_code, shipping_country_code,
-        credit_card_country_code, fast_lane, isfba, has_prime, gl_code,
-        payment_method, issuing_bank, description, damage_classification,
-        chat_text, image_hash
+        credit_card_country_code, fast_lane, isfba, has_prime,
+        gl_code, payment_method, issuing_bank, description,
+        damage_classification, chat_text, image_hash
         FROM records
     """, conn)
+
     if df.empty:
         st.info("No records found.")
     else:
-        df = df.replace({None:"", "None":"", np.nan:""})
-        top1, top2, top3 = st.columns([3,1,1])
-        q = top1.text_input("Search (any field or chat)")
-        show_img = top2.toggle("Show Images", value=True)
-        csv_data = df.to_csv(index=False).encode('utf-8')
-        top3.download_button("Download CSV", data=csv_data, file_name="claims_full.csv")
+        query_col, toggle_col, dl_col = st.columns([3, 1, 1])
+        query = query_col.text_input("Search (any field or chat)")
+        show_img = toggle_col.toggle("Show Images", value=True)
 
-        filtered = df[df.apply(lambda r: q.lower() in str(r.values).lower(), axis=1)] if q else df
+        if query:
+            df = df[df.apply(lambda r: query.lower() in str(r.values).lower(), axis=1)]
 
-        for uid in filtered["unique_image_id"].unique():
+        csv = df.to_csv(index=False).encode("utf-8")
+        dl_col.download_button("Download CSV", data=csv, file_name="claims_full_audit.csv")
+
+        for uid in df["unique_image_id"].unique():
             st.markdown(f"### Main Cluster: `{uid}`")
-            sub_df = filtered[filtered["unique_image_id"] == uid]
+            sub_df = df[df["unique_image_id"] == uid]
             for sc in sub_df["sub_cluster_id"].unique():
                 st.caption(f"Subcluster: {sc}")
-                sub = sub_df[sub_df["sub_cluster_id"] == sc].copy()
-                c1, c2 = st.columns([6,1.2])
-                with c1:
-                    view = sub[["customer_id","order_id","ip_country_code","billing_country_code",
-                                "shipping_country_code","credit_card_country_code","gl_code",
-                                "payment_method","issuing_bank","description","damage_classification","chat_text"]].rename(columns={
-                                    "customer_id":"Customer","order_id":"Order","ip_country_code":"IP",
-                                    "billing_country_code":"Billing","shipping_country_code":"Shipping",
-                                    "credit_card_country_code":"Card","gl_code":"GL","payment_method":"PayMethod",
-                                    "issuing_bank":"Bank","description":"Description","damage_classification":"Damage",
-                                    "chat_text":"Chat"
-                                })
+                sub = sub_df[sub_df["sub_cluster_id"] == sc]
+                col1, col2 = st.columns([6, 1.2])
+                with col1:
+                    view = sub.rename(columns={
+                        "customer_id": "Customer",
+                        "order_id": "Order",
+                        "ip_country_code": "IP",
+                        "billing_country_code": "Billing",
+                        "shipping_country_code": "Shipping",
+                        "credit_card_country_code": "Card",
+                        "gl_code": "GL",
+                        "payment_method": "PayMethod",
+                        "issuing_bank": "Bank",
+                        "description": "Description",
+                        "damage_classification": "Damage",
+                        "chat_text": "Chat"
+                    })[
+                        ["Customer", "Order", "IP", "Billing", "Shipping", "Card", "GL", "PayMethod", "Bank", "Description", "Damage", "Chat"]
+                    ]
                     st.dataframe(view, use_container_width=True, hide_index=True)
-                with c2:
+                with col2:
                     if show_img:
-                        for _, row in sub.iterrows():
-                            path = os.path.join(IMAGE_FOLDER, f"{row['image_hash']}.png")
+                        for _, r in sub.iterrows():
+                            path = os.path.join(IMAGE_FOLDER, f"{r['image_hash']}.png")
                             if os.path.exists(path):
                                 st.image(path, width=80)
                             else:
