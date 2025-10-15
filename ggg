@@ -1,6 +1,7 @@
 elif menu == "Database Viewer":
     st.title("Database Viewer")
 
+    # Load records
     df = pd.read_sql_query("""
         SELECT id, unique_image_id, sub_cluster_id, customer_id, order_id,
                ip_country_code, billing_country_code, shipping_country_code,
@@ -13,6 +14,7 @@ elif menu == "Database Viewer":
     if df.empty:
         st.info("No records found.")
     else:
+        # Top search controls
         q_col, img_col, chat_col, dl_col = st.columns([3, 1, 1, 1])
         q = q_col.text_input("Search (any field or chat)")
         show_img = img_col.toggle("Show Images", True)
@@ -21,11 +23,12 @@ elif menu == "Database Viewer":
         csv = df.to_csv(index=False).encode("utf-8")
         dl_col.download_button("Download CSV", csv, "claims.csv")
 
+        # Search filter
         if q:
             ql = q.lower()
             df = df[df.apply(lambda r: ql in " ".join(map(str, r.values)).lower(), axis=1)]
 
-        # Ensure numeric value for calculations
+        # Clean numeric values
         df["value_usd"] = pd.to_numeric(df["value_usd"], errors="coerce").fillna(0)
 
         # ----------------------------
@@ -40,38 +43,46 @@ elif menu == "Database Viewer":
             df.loc[(df["unique_image_id"] == cluster_id) & (df["id"] != min_id), "refund_status"] = "Denied"
 
         # ----------------------------
-        # Display clusters
+        # Display Clusters
         # ----------------------------
         for uid in df["unique_image_id"].unique():
-            st.subheader(f"Main Cluster: {uid}")
-
             cluster_df = df[df["unique_image_id"] == uid].copy()
+
+            # Cluster stats
             total_cluster_value = cluster_df["value_usd"].sum()
             total_subclusters = cluster_df["sub_cluster_id"].nunique()
             total_accounts = len(cluster_df)
             total_savings = cluster_df.loc[cluster_df["refund_status"] == "Denied", "value_usd"].sum()
 
-            st.write(
-                f"**Total Cluster Value:** ${total_cluster_value:,.2f}  |  "
-                f"**Total Subclusters:** {total_subclusters}  |  "
-                f"**Total Accounts:** {total_accounts}  |  "
-                f"**Savings:** ${total_savings:,.2f}"
-            )
+            # Cluster ID in green
+            st.markdown(f"**Main Cluster:** :green[{uid}]")
 
+            # Clean cluster summary
+            cluster_summary = (
+                f"Total Cluster Value: ${total_cluster_value:,.2f}    |    "
+                f"Total Subclusters: {total_subclusters}    |    "
+                f"Total Accounts: {total_accounts}    |    "
+                f"Savings: ${total_savings:,.2f}"
+            )
+            st.text(cluster_summary)
+
+            # ----------------------------
+            # Subclusters within cluster
+            # ----------------------------
             for sc in cluster_df["sub_cluster_id"].unique():
                 sub = cluster_df[cluster_df["sub_cluster_id"] == sc].copy()
+
                 total_value = sub["value_usd"].sum()
                 account_count = len(sub)
                 sub_savings = sub.loc[sub["refund_status"] == "Denied", "value_usd"].sum()
 
-                st.markdown(
-                    f"**Subcluster:** {sc}  |  **Accounts:** {account_count}  |  "
-                    f"**Total:** ${total_value:,.2f}  |  **Savings:** ${sub_savings:,.2f}"
+                sub_summary = (
+                    f"Subcluster: {sc}    |    Accounts: {account_count}    |    "
+                    f"Total: ${total_value:,.2f}    |    Savings: ${sub_savings:,.2f}"
                 )
+                st.text(sub_summary)
 
-                # ----------------------------
-                # Column Order Cleanup
-                # ----------------------------
+                # Clean column ordering
                 sub_disp = sub.drop(columns=["unique_image_id", "sub_cluster_id", "image_hash"], errors="ignore")
 
                 if not show_chat:
@@ -87,12 +98,20 @@ elif menu == "Database Viewer":
                 ]
                 sub_disp = sub_disp[[col for col in desired_order if col in sub_disp.columns]]
 
-                # ----------------------------
-                # Display Table + Images
-                # ----------------------------
+                # Color Refund Status for readability (native Streamlit styling)
+                def highlight_refund(val):
+                    color = "green" if val == "Approved" else ("red" if val == "Denied" else "black")
+                    return f"color: {color}"
+
                 col_table, col_img = st.columns([5, 1.5])
                 with col_table:
-                    st.dataframe(sub_disp, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        sub_disp.style.map(highlight_refund, subset=["refund_status"]),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                # Image column display
                 with col_img:
                     if show_img:
                         st.write("")
