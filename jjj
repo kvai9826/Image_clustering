@@ -1,0 +1,151 @@
+import base64
+
+elif menu == "Database Viewer":
+    st.title("Database Viewer")
+
+    # Load records
+    df = pd.read_sql_query("""
+        SELECT id, unique_image_id, sub_cluster_id, customer_id, order_id,
+               ip_country_code, billing_country_code, shipping_country_code,
+               credit_card_country_code, fast_lane, isfba, has_prime,
+               gl_code, payment_method, issuing_bank, item_name, value_usd, description,
+               damage_classification, chat_text, image_hash
+        FROM records
+    """, conn)
+
+    if df.empty:
+        st.info("No records found.")
+    else:
+        # Top search controls
+        q_col, img_col, chat_col, dl_col = st.columns([3, 1, 1, 1])
+        q = q_col.text_input("Search (any field or chat)")
+        show_img = img_col.toggle("Show Images", True)
+        show_chat = chat_col.toggle("Show Chat", False)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        dl_col.download_button("Download CSV", csv, "claims.csv")
+
+        # Search filter
+        if q:
+            ql = q.lower()
+            df = df[df.apply(lambda r: ql in " ".join(map(str, r.values)).lower(), axis=1)]
+
+        # Clean numeric values
+        df["value_usd"] = pd.to_numeric(df["value_usd"], errors="coerce").fillna(0)
+
+        # ----------------------------
+        # Refund Status Logic
+        # ----------------------------
+        df["refund_status"] = None
+        df = df.sort_values(by="id", ascending=True)
+
+        for cluster_id, group in df.groupby("unique_image_id"):
+            min_id = group["id"].min()
+            df.loc[df["id"] == min_id, "refund_status"] = "Approved"
+            df.loc[(df["unique_image_id"] == cluster_id) & (df["id"] != min_id), "refund_status"] = "Denied"
+
+        # ----------------------------
+        # Display Clusters
+        # ----------------------------
+        for uid in df["unique_image_id"].unique():
+            cluster_df = df[df["unique_image_id"] == uid].copy()
+
+            # Cluster stats
+            total_cluster_value = cluster_df["value_usd"].sum()
+            total_subclusters = cluster_df["sub_cluster_id"].nunique()
+            total_accounts = len(cluster_df)
+            total_savings = cluster_df.loc[cluster_df["refund_status"] == "Denied", "value_usd"].sum()
+
+            # Cluster ID in green
+            st.markdown(f"**Main Cluster:** :green[{uid}]")
+
+            # Clean cluster summary
+            cluster_summary = (
+                f"Total Cluster Value: ${total_cluster_value:,.2f}    |    "
+                f"Total Subclusters: {total_subclusters}    |    "
+                f"Total Accounts: {total_accounts}    |    "
+                f"Savings: ${total_savings:,.2f}"
+            )
+            st.text(cluster_summary)
+
+            # ----------------------------
+            # Subclusters within cluster
+            # ----------------------------
+            for sc in cluster_df["sub_cluster_id"].unique():
+                sub = cluster_df[cluster_df["sub_cluster_id"] == sc].copy()
+
+                total_value = sub["value_usd"].sum()
+                account_count = len(sub)
+                sub_savings = sub.loc[sub["refund_status"] == "Denied", "value_usd"].sum()
+
+                sub_summary = (
+                    f"Subcluster: {sc}    |    Accounts: {account_count}    |    "
+                    f"Total: ${total_value:,.2f}    |    Savings: ${sub_savings:,.2f}"
+                )
+                st.text(sub_summary)
+
+                # Clean column ordering
+                sub_disp = sub.drop(columns=["unique_image_id", "sub_cluster_id", "image_hash"], errors="ignore")
+
+                if not show_chat:
+                    sub_disp = sub_disp.drop(columns=["chat_text"], errors="ignore")
+
+                desired_order = [
+                    "refund_status", "customer_id", "order_id",
+                    "ip_country_code", "billing_country_code", "shipping_country_code", "credit_card_country_code",
+                    "fast_lane", "isfba", "has_prime",
+                    "gl_code", "payment_method", "issuing_bank",
+                    "item_name", "value_usd", "damage_classification",
+                    "description"
+                ]
+                sub_disp = sub_disp[[col for col in desired_order if col in sub_disp.columns]]
+
+                # Refund status colors
+                def highlight_refund(val):
+                    color = "green" if val == "Approved" else ("red" if val == "Denied" else "black")
+                    return f"color: {color}"
+
+                # ----------------------------
+                # Table + Image Display with Hover Zoom
+                # ----------------------------
+                col_table, col_img = st.columns([5, 1.5])
+
+                with col_table:
+                    st.dataframe(
+                        sub_disp.style.map(highlight_refund, subset=["refund_status"]),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                with col_img:
+                    if show_img:
+                        # Add hover zoom effect CSS once
+                        st.markdown("""
+                            <style>
+                            .zoom-img {
+                                transition: transform 0.2s ease;
+                                border-radius: 4px;
+                                margin-bottom: 4px;
+                            }
+                            .zoom-img:hover {
+                                transform: scale(4);
+                                z-index: 999;
+                                position: relative;
+                            }
+                            </style>
+                        """, unsafe_allow_html=True)
+
+                        # Display each image inline with hover zoom
+                        for _, r in sub.reset_index(drop=True).iterrows():
+                            img_path = os.path.join(IMAGE_FOLDER, f"{r['image_hash']}.png")
+                            if os.path.exists(img_path):
+                                with open(img_path, "rb") as f:
+                                    img_b64 = base64.b64encode(f.read()).decode()
+                                st.markdown(
+                                    f'<img src="data:image/png;base64,{img_b64}" width="40" class="zoom-img">',
+                                    unsafe_allow_html=True
+                                )
+                            else:
+                                st.empty()
+                    else:
+                        st.write("")  # keep layout consistent
