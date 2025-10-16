@@ -1,0 +1,176 @@
+import base64
+import math
+
+elif menu == "Database Viewer":
+    st.title("Database Viewer")
+
+    # Load records
+    df = pd.read_sql_query("""
+        SELECT id, unique_image_id, sub_cluster_id, customer_id, order_id,
+               ip_country_code, billing_country_code, shipping_country_code,
+               credit_card_country_code, fast_lane, isfba, has_prime,
+               gl_code, payment_method, issuing_bank, item_name, value_usd, description,
+               damage_classification, chat_text, image_hash
+        FROM records
+    """, conn)
+
+    if df.empty:
+        st.info("No records found.")
+    else:
+        # Top search + toggles
+        q_col, img_col, chat_col, dl_col = st.columns([3, 1, 1, 1])
+        q = q_col.text_input("Search (any field or chat)")
+        show_img = img_col.toggle("Show Images", True)
+        show_chat = chat_col.toggle("Show Chat", False)
+        csv = df.to_csv(index=False).encode("utf-8")
+        dl_col.download_button("Download CSV", csv, "claims.csv")
+
+        # Search filter
+        if q:
+            ql = q.lower()
+            df = df[df.apply(lambda r: ql in " ".join(map(str, r.values)).lower(), axis=1)]
+
+        df["value_usd"] = pd.to_numeric(df["value_usd"], errors="coerce").fillna(0)
+
+        # Refund Status Logic
+        df["refund_status"] = None
+        df = df.sort_values(by="id", ascending=True)
+        for cluster_id, group in df.groupby("unique_image_id"):
+            min_id = group["id"].min()
+            df.loc[df["id"] == min_id, "refund_status"] = "Approved"
+            df.loc[(df["unique_image_id"] == cluster_id) & (df["id"] != min_id), "refund_status"] = "Denied"
+
+        # Loop through clusters
+        for uid in df["unique_image_id"].unique():
+            cluster_df = df[df["unique_image_id"] == uid].copy()
+
+            # Cluster stats
+            total_cluster_value = cluster_df["value_usd"].sum()
+            total_subclusters = cluster_df["sub_cluster_id"].nunique()
+            total_accounts = len(cluster_df)
+            total_savings = cluster_df.loc[cluster_df["refund_status"] == "Denied", "value_usd"].sum()
+
+            st.markdown(f"**Main Cluster:** :green[{uid}]")
+            st.text(
+                f"Total Cluster Value: ${total_cluster_value:,.2f}    |    "
+                f"Total Subclusters: {total_subclusters}    |    "
+                f"Total Accounts: {total_accounts}    |    "
+                f"Savings: ${total_savings:,.2f}"
+            )
+
+            for sc in cluster_df["sub_cluster_id"].unique():
+                sub = cluster_df[cluster_df["sub_cluster_id"] == sc].copy()
+                total_value = sub["value_usd"].sum()
+                account_count = len(sub)
+                sub_savings = sub.loc[sub["refund_status"] == "Denied", "value_usd"].sum()
+
+                st.text(
+                    f"Subcluster: {sc}    |    Accounts: {account_count}    |    "
+                    f"Total: ${total_value:,.2f}    |    Savings: ${sub_savings:,.2f}"
+                )
+
+                # Remove unnecessary columns
+                sub_disp = sub.drop(columns=["unique_image_id", "sub_cluster_id", "image_hash"], errors="ignore")
+                if not show_chat:
+                    sub_disp = sub_disp.drop(columns=["chat_text"], errors="ignore")
+
+                # Pagination setup
+                rows_per_page = 25
+                total_pages = math.ceil(len(sub_disp) / rows_per_page)
+                page = st.number_input("Page", 1, total_pages, 1, key=f"page_{sc}_{uid}")
+
+                start = (page - 1) * rows_per_page
+                end = start + rows_per_page
+                page_data = sub_disp.iloc[start:end]
+
+                # Build HTML table manually for alignment + speed
+                table_html = """
+                <style>
+                    table.custom-table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        font-size: 14px;
+                    }
+                    table.custom-table th, table.custom-table td {
+                        border: 1px solid #444;
+                        text-align: center;
+                        padding: 6px;
+                        vertical-align: middle;
+                    }
+                    table.custom-table img {
+                        width: 40px;
+                        height: 40px;
+                        object-fit: cover;
+                        border-radius: 4px;
+                        transition: transform 0.2s ease;
+                    }
+                    table.custom-table img:hover {
+                        transform: scale(3.5);
+                        z-index: 999;
+                        position: relative;
+                    }
+                    .approved { color: green; font-weight: bold; }
+                    .denied { color: red; font-weight: bold; }
+                </style>
+                <table class="custom-table">
+                    <tr>
+                        <th>Refund Status</th>
+                        <th>Customer ID</th>
+                        <th>Order ID</th>
+                        <th>IP</th>
+                        <th>Billing</th>
+                        <th>Shipping</th>
+                        <th>Card Code</th>
+                        <th>Fast Lane</th>
+                        <th>FBA</th>
+                        <th>Prime</th>
+                        <th>GL</th>
+                        <th>Payment</th>
+                        <th>Bank</th>
+                        <th>Item</th>
+                        <th>Value ($)</th>
+                        <th>Damage</th>
+                        <th>Description</th>
+                        {}
+                    </tr>
+                """.format("<th>Image</th>" if show_img else "")
+
+                # Fill rows
+                for _, row in page_data.iterrows():
+                    refund_class = "approved" if row["refund_status"] == "Approved" else "denied"
+                    img_html = ""
+                    if show_img:
+                        img_path = os.path.join(IMAGE_FOLDER, f"{row['image_hash']}.png")
+                        if os.path.exists(img_path):
+                            with open(img_path, "rb") as f:
+                                img_b64 = base64.b64encode(f.read()).decode()
+                            img_html = f'<td><img src="data:image/png;base64,{img_b64}"></td>'
+                        else:
+                            img_html = "<td></td>"
+
+                    table_html += f"""
+                    <tr>
+                        <td class='{refund_class}'>{row['refund_status']}</td>
+                        <td>{row['customer_id']}</td>
+                        <td>{row['order_id']}</td>
+                        <td>{row['ip_country_code']}</td>
+                        <td>{row['billing_country_code']}</td>
+                        <td>{row['shipping_country_code']}</td>
+                        <td>{row['credit_card_country_code']}</td>
+                        <td>{row['fast_lane']}</td>
+                        <td>{row['isfba']}</td>
+                        <td>{row['has_prime']}</td>
+                        <td>{row['gl_code']}</td>
+                        <td>{row['payment_method']}</td>
+                        <td>{row['issuing_bank']}</td>
+                        <td>{row['item_name']}</td>
+                        <td>{row['value_usd']:.2f}</td>
+                        <td>{row['damage_classification']}</td>
+                        <td>{row['description']}</td>
+                        {img_html}
+                    </tr>
+                    """
+                table_html += "</table>"
+
+                # Render clean table
+                st.markdown(table_html, unsafe_allow_html=True)
